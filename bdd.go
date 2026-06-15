@@ -1,11 +1,3 @@
-// Package gobdd implements Ordered Binary Decision Diagrams (OBDDs)
-// with off-heap memory via github.com/xDarkicex/memory.
-//
-// BDDs provide a canonical representation of Boolean functions. Two functions
-// are equivalent iff their BDDs are identical — O(1) comparison after construction.
-//
-// Core operations (And, Or, Not) are built on the universal ITE (if-then-else)
-// operator with memoization for polynomial-time complexity.
 package gobdd
 
 import (
@@ -15,107 +7,162 @@ import (
 )
 
 // BDD is a manager for Binary Decision Diagrams.
-// All state lives in off-heap Pool-allocated slices — zero GC pressure.
 type BDD struct {
-	nodes   []bddNode  // Pool-backed node table
-	varCnt  int32      // number of variables registered
-	pool    *memory.Pool
-	uniq    *uniqTable // unique table: (var,lo,hi) → node index
-	cache   *opCache   // operation cache for ITE memoization
+	nodes     []bddNode
+	varCnt    int32
+	var2level []int32
+	level2var []int32
+	pool      *memory.Pool
+	uniq      *uniqTable
+	cache     *opCache
+	refCount  []int32 // external reference count per node (nil until first AddRef)
 }
 
 type bddNode struct {
-	vari int32 // variable index (0..n-1), -1 for terminals
-	lo   int32 // child index when var=0
-	hi   int32 // child index when var=1
+	level int32
+	lo    int32
+	hi    int32
 }
-
-const (
-	falseIdx = 0
-	trueIdx  = 1
-)
 
 // New creates a BDD manager with the given number of variables.
 func New(numVars int, pool *memory.Pool) *BDD {
 	cap := numVars*256 + 16
 	nodes := memory.MustPoolSlice[bddNode](pool, cap)
 	nodes = nodes[:2]
-	nodes[falseIdx] = bddNode{vari: -1, lo: -1, hi: -1}
-	nodes[trueIdx] = bddNode{vari: -1, lo: -1, hi: -1}
+	nodes[0] = bddNode{level: -1, lo: -1, hi: -1}
+	nodes[1] = bddNode{level: -1, lo: -1, hi: -1}
+
+	var2level := memory.MustPoolSlice[int32](pool, numVars)
+	var2level = var2level[:numVars]
+	level2var := memory.MustPoolSlice[int32](pool, numVars)
+	level2var = level2var[:numVars]
+	for i := 0; i < numVars; i++ {
+		var2level[i] = int32(i)
+		level2var[i] = int32(i)
+	}
+
 	return &BDD{
-		nodes:  nodes,
-		varCnt: int32(numVars),
-		pool:   pool,
-		uniq:   newUniqTable(pool),
-		cache:  newOpCache(pool),
+		nodes:     nodes,
+		varCnt:    int32(numVars),
+		var2level: var2level,
+		level2var: level2var,
+		pool:      pool,
+		uniq:      newUniqTable(pool),
+		cache:     newOpCache(pool),
 	}
 }
 
-// VarCount returns the number of variables.
 func (b *BDD) VarCount() int32 { return b.varCnt }
 
-// Var returns the BDD for variable v (0-indexed).
-func (b *BDD) Var(v int32) int32 {
+func (b *BDD) levelOf(v int32) int32 {
+	if v < 0 || v >= b.varCnt {
+		return -1
+	}
+	return b.var2level[v]
+}
+
+func (b *BDD) varOf(level int32) int32 {
+	if level < 0 || level >= b.varCnt {
+		return -1
+	}
+	return b.level2var[level]
+}
+
+// Accessors matching buddy bdd_var / bdd_low / bdd_high.
+
+func (b *BDD) VarOf(f NodeID) int32 {
+	if f.isTerm() {
+		return -1
+	}
+	return b.level2var[b.nodes[f].level]
+}
+
+func (b *BDD) Low(f NodeID) NodeID {
+	if f.isTerm() {
+		return f
+	}
+	return NodeID(b.nodes[f].lo)
+}
+
+func (b *BDD) High(f NodeID) NodeID {
+	if f.isTerm() {
+		return f
+	}
+	return NodeID(b.nodes[f].hi)
+}
+
+// NodeCount returns the total number of allocated nodes.
+func (b *BDD) NodeCount() int { return len(b.nodes) }
+
+// SupportBDD returns the support of f as a BDD variable set.
+// Matches buddy bdd_support (bddop.c:2053).
+func (b *BDD) SupportBDD(f NodeID) NodeID {
+	return b.MakeSet(b.Support(f))
+}
+
+// SatCountDouble returns the number of satisfying assignments as float64.
+// Matches buddy bdd_satcount (bddop.c:2460).
+func (b *BDD) SatCountDouble(f NodeID) float64 {
+	return float64(b.SatisfyCount(f))
+}
+
+// AnodeCount counts distinct nodes across an array of BDDs.
+// Shared nodes are counted only once. Matches buddy bdd_anodecount (bddop.c:2653). CC=4.
+func (b *BDD) AnodeCount(roots []NodeID) int {
+	seen := memory.MustPoolSlice[bool](b.pool, len(b.nodes))
+	seen = seen[:len(b.nodes)]
+	cou := 0
+	for _, r := range roots {
+		cou += b.countNodes(r, seen)
+	}
+	return cou
+}
+
+// --- Core BDD constructors ---
+
+func (b *BDD) Var(v int32) NodeID {
 	if v < 0 || v >= b.varCnt {
 		return falseIdx
 	}
-	return b.unique(v, falseIdx, trueIdx)
+	return b.unique(b.var2level[v], int32(falseIdx), int32(trueIdx))
 }
 
-// Not returns the negation of f.
-func (b *BDD) Not(f int32) int32 { return b.ITE(f, falseIdx, trueIdx) }
+func (b *BDD) Not(f NodeID) NodeID          { return b.ITE(f, falseIdx, trueIdx) }
+func (b *BDD) And(f, g NodeID) NodeID        { return b.ITE(f, g, falseIdx) }
+func (b *BDD) Or(f, g NodeID) NodeID         { return b.ITE(f, trueIdx, g) }
+func (b *BDD) Implies(f, g NodeID) NodeID    { return b.ITE(f, g, trueIdx) }
+func (b *BDD) Xor(f, g NodeID) NodeID        { return b.ITE(f, b.Not(g), g) }
+func (b *BDD) Equiv(f, g NodeID) NodeID      { return b.ITE(f, g, b.Not(g)) }
+func (b *BDD) Nand(f, g NodeID) NodeID       { return b.Not(b.And(f, g)) }
+func (b *BDD) Nor(f, g NodeID) NodeID        { return b.Not(b.Or(f, g)) }
 
-// And returns f ∧ g.
-func (b *BDD) And(f, g int32) int32 { return b.ITE(f, g, falseIdx) }
+// --- Restrict, Exists, ForAll, Compose ---
 
-// Or returns f ∨ g.
-func (b *BDD) Or(f, g int32) int32 { return b.ITE(f, trueIdx, g) }
-
-// Implies returns f → g.
-func (b *BDD) Implies(f, g int32) int32 { return b.ITE(f, g, trueIdx) }
-
-// Xor returns f ⊕ g.
-func (b *BDD) Xor(f, g int32) int32 { return b.ITE(f, b.Not(g), g) }
-
-// Equiv returns f ↔ g.
-func (b *BDD) Equiv(f, g int32) int32 { return b.ITE(f, g, b.Not(g)) }
-
-// Nand returns ¬(f ∧ g).
-func (b *BDD) Nand(f, g int32) int32 { return b.Not(b.And(f, g)) }
-
-// Nor returns ¬(f ∨ g).
-func (b *BDD) Nor(f, g int32) int32 { return b.Not(b.Or(f, g)) }
-
-// Restrict returns f with variable v set to value.
-// f[v := value] — cofactor operation. CC=3.
-func (b *BDD) Restrict(f int32, v int32, value bool) int32 {
-	if f < 2 {
+func (b *BDD) Restrict(f NodeID, v int32, value bool) NodeID {
+	vl := b.levelOf(v)
+	if f.isTerm() {
 		return f
 	}
 	n := b.nodes[f]
-	if n.vari > v {
+	if n.level > vl {
 		return f
 	}
-	if n.vari == v {
+	if n.level == vl {
 		if value {
-			return n.hi
+			return NodeID(n.hi)
 		}
-		return n.lo
+		return NodeID(n.lo)
 	}
-	lo := b.Restrict(n.lo, v, value)
-	hi := b.Restrict(n.hi, v, value)
-	return b.unique(n.vari, lo, hi)
+	lo := b.Restrict(NodeID(n.lo), v, value)
+	hi := b.Restrict(NodeID(n.hi), v, value)
+	return b.unique(n.level, int32(lo), int32(hi))
 }
 
-// Exists returns ∃v. f — existential quantification.
-// ∃v. f = f[v:=0] ∨ f[v:=1]. CC=2.
-func (b *BDD) Exists(f int32, v int32) int32 {
+func (b *BDD) Exists(f NodeID, v int32) NodeID {
 	return b.Or(b.Restrict(f, v, false), b.Restrict(f, v, true))
 }
 
-// ExistsAll returns ∃vars. f — existentially quantify multiple variables.
-// CC=2.
-func (b *BDD) ExistsAll(f int32, vars []int32) int32 {
+func (b *BDD) ExistsAll(f NodeID, vars []int32) NodeID {
 	r := f
 	for _, v := range vars {
 		r = b.Exists(r, v)
@@ -123,14 +170,11 @@ func (b *BDD) ExistsAll(f int32, vars []int32) int32 {
 	return r
 }
 
-// ForAll returns ∀v. f — universal quantification.
-// ∀v. f = f[v:=0] ∧ f[v:=1]. CC=2.
-func (b *BDD) ForAll(f int32, v int32) int32 {
+func (b *BDD) ForAll(f NodeID, v int32) NodeID {
 	return b.And(b.Restrict(f, v, false), b.Restrict(f, v, true))
 }
 
-// ForAllVars returns ∀vars. f.
-func (b *BDD) ForAllVars(f int32, vars []int32) int32 {
+func (b *BDD) ForAllVars(f NodeID, vars []int32) NodeID {
 	r := f
 	for _, v := range vars {
 		r = b.ForAll(r, v)
@@ -138,83 +182,82 @@ func (b *BDD) ForAllVars(f int32, vars []int32) int32 {
 	return r
 }
 
-// Compose returns f[v := g] — substitute variable v with BDD g.
-// f composed with g for variable v. CC=4.
-func (b *BDD) Compose(f int32, v int32, g int32) int32 {
-	if f < 2 {
+func (b *BDD) Compose(f NodeID, v int32, g NodeID) NodeID {
+	vl := b.levelOf(v)
+	if f.isTerm() {
 		return f
 	}
 	n := b.nodes[f]
-	if n.vari > v {
+	if n.level > vl {
 		return f
 	}
-	if n.vari == v {
-		return b.ITE(g, n.hi, n.lo)
+	if n.level == vl {
+		return b.ITE(g, NodeID(n.hi), NodeID(n.lo))
 	}
-	lo := b.Compose(n.lo, v, g)
-	hi := b.Compose(n.hi, v, g)
-	return b.unique(n.vari, lo, hi)
+	lo := b.Compose(NodeID(n.lo), v, g)
+	hi := b.Compose(NodeID(n.hi), v, g)
+	return b.unique(n.level, int32(lo), int32(hi))
 }
 
-// Support returns the set of variables that f depends on.
-// CC=3.
-func (b *BDD) Support(f int32) []int32 {
-	seen := make([]bool, b.varCnt)
+// --- Support, Satisfy ---
+
+func (b *BDD) Support(f NodeID) []int32 {
+	seen := memory.MustPoolSlice[bool](b.pool, int(b.varCnt))
+	seen = seen[:b.varCnt]
 	b.supportWalk(f, seen)
 	var result []int32
 	for i, s := range seen {
 		if s {
-			result = append(result, int32(i))
+			result = append(result, b.level2var[int32(i)])
 		}
 	}
 	return result
 }
 
-func (b *BDD) supportWalk(f int32, seen []bool) {
-	if f < 2 {
+func (b *BDD) supportWalk(f NodeID, seen []bool) {
+	if f.isTerm() {
 		return
 	}
 	n := b.nodes[f]
-	seen[n.vari] = true
-	b.supportWalk(n.lo, seen)
-	b.supportWalk(n.hi, seen)
+	seen[n.level] = true
+	b.supportWalk(NodeID(n.lo), seen)
+	b.supportWalk(NodeID(n.hi), seen)
 }
 
-// SatisfyOne returns one satisfying assignment, or nil if f is False.
-func (b *BDD) SatisfyOne(f int32) []bool {
+func (b *BDD) SatisfyOne(f NodeID) []bool {
 	if f == falseIdx {
 		return nil
 	}
-	assign := make([]bool, b.varCnt)
+	assign := memory.MustPoolSlice[bool](b.pool, int(b.varCnt))
+	assign = assign[:b.varCnt]
 	b.satWalk(f, assign)
 	return assign
 }
 
-func (b *BDD) satWalk(f int32, assign []bool) {
-	for f >= 2 {
+func (b *BDD) satWalk(f NodeID, assign []bool) {
+	for !f.isTerm() {
 		n := b.nodes[f]
-		if n.lo != falseIdx {
-			assign[n.vari] = false
-			f = n.lo
+		v := b.level2var[n.level]
+		if n.lo != int32(falseIdx) {
+			assign[v] = false
+			f = NodeID(n.lo)
 		} else {
-			assign[n.vari] = true
-			f = n.hi
+			assign[v] = true
+			f = NodeID(n.hi)
 		}
 	}
 }
 
-// SatisfyCount returns the number of satisfying assignments.
-// Uses dynamic programming on the BDD structure. CC=5.
-func (b *BDD) SatisfyCount(f int32) uint64 {
+func (b *BDD) SatisfyCount(f NodeID) uint64 {
 	counts := memory.MustPoolSlice[uint64](b.pool, len(b.nodes))
 	counts = counts[:len(b.nodes)]
 	for i := range counts {
-		counts[i] = ^uint64(0) // sentinel for "not computed"
+		counts[i] = ^uint64(0)
 	}
 	return b.satCount(f, counts)
 }
 
-func (b *BDD) satCount(f int32, counts []uint64) uint64 {
+func (b *BDD) satCount(f NodeID, counts []uint64) uint64 {
 	if f == falseIdx {
 		return 0
 	}
@@ -225,31 +268,23 @@ func (b *BDD) satCount(f int32, counts []uint64) uint64 {
 		return counts[f]
 	}
 	n := b.nodes[f]
-	lo := b.satCount(n.lo, counts)
-	hi := b.satCount(n.hi, counts)
-	// Each path skips the vars between this level and the child
+	lo := b.satCount(NodeID(n.lo), counts)
+	hi := b.satCount(NodeID(n.hi), counts)
 	loShift := lo >> 1
-	hiShift := hi >> 1
-	if n.lo < 2 || b.nodes[n.lo].vari != n.vari+1 {
-		loShift = lo >> 1
-	} else {
+	if n.lo >= 2 && b.nodes[n.lo].level == n.level+1 {
 		loShift = lo
 	}
-	if n.hi < 2 || b.nodes[n.hi].vari != n.vari+1 {
-		hiShift = hi >> 1
-	} else {
+	hiShift := hi >> 1
+	if n.hi >= 2 && b.nodes[n.hi].level == n.level+1 {
 		hiShift = hi
 	}
 	counts[f] = loShift + hiShift
 	return counts[f]
 }
 
-// NodeCount returns the total number of nodes.
-func (b *BDD) NodeCount() int { return len(b.nodes) }
+// --- ITE: universal if-then-else ---
 
-// ITE is the universal if-then-else: if f then g else h.
-// O(|f|·|g|·|h|) worst-case, O(|f|+|g|+|h|) with memoization. CC=7.
-func (b *BDD) ITE(f, g, h int32) int32 {
+func (b *BDD) ITE(f, g, h NodeID) NodeID {
 	if f == trueIdx {
 		return g
 	}
@@ -262,9 +297,8 @@ func (b *BDD) ITE(f, g, h int32) int32 {
 	if g == trueIdx && h == falseIdx {
 		return f
 	}
-
-	if r, ok := b.cache.get(f, g, h); ok {
-		return r
+	if r, ok := b.cache.get(int32(f), int32(g), int32(h)); ok {
+		return NodeID(r)
 	}
 
 	v := b.topVar(f, g, h)
@@ -272,60 +306,59 @@ func (b *BDD) ITE(f, g, h int32) int32 {
 	hi := b.ITE(b.cofactor(f, v, true), b.cofactor(g, v, true), b.cofactor(h, v, true))
 
 	if lo == hi {
-		b.cache.put(f, g, h, lo)
+		b.cache.put(int32(f), int32(g), int32(h), int32(lo))
 		return lo
 	}
-
-	r := b.unique(v, lo, hi)
-	b.cache.put(f, g, h, r)
+	r := b.unique(v, int32(lo), int32(hi))
+	b.cache.put(int32(f), int32(g), int32(h), int32(r))
 	return r
 }
 
-func (b *BDD) topVar(f, g, h int32) int32 {
+func (b *BDD) topVar(f, g, h NodeID) int32 {
 	v := b.varCnt
-	if f >= 2 && b.nodes[f].vari < v {
-		v = b.nodes[f].vari
+	if !f.isTerm() && b.nodes[f].level < v {
+		v = b.nodes[f].level
 	}
-	if g >= 2 && b.nodes[g].vari < v {
-		v = b.nodes[g].vari
+	if !g.isTerm() && b.nodes[g].level < v {
+		v = b.nodes[g].level
 	}
-	if h >= 2 && b.nodes[h].vari < v {
-		v = b.nodes[h].vari
+	if !h.isTerm() && b.nodes[h].level < v {
+		v = b.nodes[h].level
 	}
 	return v
 }
 
-func (b *BDD) cofactor(f int32, v int32, value bool) int32 {
-	if f < 2 {
+func (b *BDD) cofactor(f NodeID, v int32, value bool) NodeID {
+	if f.isTerm() {
 		return f
 	}
 	nf := b.nodes[f]
-	if nf.vari > v {
+	if nf.level > v {
 		return f
 	}
-	if nf.vari == v {
+	if nf.level == v {
 		if value {
-			return nf.hi
+			return NodeID(nf.hi)
 		}
-		return nf.lo
+		return NodeID(nf.lo)
 	}
 	return f
 }
 
-func (b *BDD) unique(v, lo, hi int32) int32 {
+func (b *BDD) unique(v, lo, hi int32) NodeID {
 	if lo == hi {
-		return lo
+		return NodeID(lo)
 	}
 	if idx, ok := b.uniq.get(v, lo, hi); ok {
-		return idx
+		return NodeID(idx)
 	}
 	idx := int32(len(b.nodes))
-	b.nodes = append(b.nodes, bddNode{vari: v, lo: lo, hi: hi})
+	b.nodes = append(b.nodes, bddNode{level: v, lo: lo, hi: hi})
 	b.uniq.put(v, lo, hi, idx)
-	return idx
+	return NodeID(idx)
 }
 
-// --- Unique table (Pool-backed open addressing) ---
+// --- Unique table ---
 
 type uniqTable struct {
 	buckets []uniqEntry
@@ -384,7 +417,7 @@ func uniqHash(v, lo, hi int32) uint32 {
 	return h
 }
 
-// --- Operation cache (ITE memoization) ---
+// --- Operation cache ---
 
 type opCache struct {
 	buckets []cacheEntry

@@ -1,93 +1,105 @@
 package gobdd
 
-// Sift reorders variables using Rudell's sifting algorithm.
+import "github.com/xDarkicex/memory"
+
 func (bd *BDD) Sift() {
-	bestCount := len(bd.nodes)
 	for v := int32(0); v < bd.varCnt; v++ {
-		bd.siftUp(v)
+		origLevel := bd.var2level[v]
+		for pos := origLevel; pos > 0; pos-- {
+			bd.swapLevels(pos - 1, pos)
+		}
 		bestPos := int32(0)
-		bestCount = len(bd.nodes)
-		for pos := int32(1); pos < bd.varCnt; pos++ {
-			bd.siftSwap(pos-1, pos)
-			if len(bd.nodes) < bestCount {
-				bestCount = len(bd.nodes)
-				bestPos = pos
+		bestSize := len(bd.nodes)
+		for pos := int32(0); pos < bd.varCnt-1; pos++ {
+			bd.swapLevels(pos, pos+1)
+			if len(bd.nodes) < bestSize {
+				bestSize = len(bd.nodes)
+				bestPos = pos + 1
 			}
 		}
 		for pos := bd.varCnt - 1; pos > bestPos; pos-- {
-			bd.siftSwap(pos-1, pos)
+			bd.swapLevels(pos - 1, pos)
 		}
 	}
 }
 
-func (bd *BDD) siftUp(v int32) {
-	for i := v; i > 0; i-- {
-		bd.siftSwap(i-1, i)
+func (bd *BDD) swapLevels(l1, l2 int32) func(oldIdx int32) int32 {
+	if l1 > l2 {
+		l1, l2 = l2, l1
+	}
+	if l1+1 != l2 || l1 < 0 || l2 >= bd.varCnt {
+		return func(oldIdx int32) int32 { return oldIdx }
+	}
+	v1 := bd.level2var[l1]
+	v2 := bd.level2var[l2]
+	bd.level2var[l1] = v2
+	bd.level2var[l2] = v1
+	bd.var2level[v1] = l2
+	bd.var2level[v2] = l1
+	for i := range bd.uniq.buckets {
+		bd.uniq.buckets[i].ok = false
+	}
+	bd.uniq.size = 0
+	oldNodes := bd.nodes
+	newCap := len(oldNodes) + 64
+	newNodes := memory.MustPoolSlice[bddNode](bd.pool, newCap)
+	newNodes = newNodes[:2]
+	newNodes[0] = oldNodes[0]
+	newNodes[1] = oldNodes[1]
+	bd.nodes = newNodes
+	remap := memory.MustPoolSlice[int32](bd.pool, len(oldNodes))
+	remap = remap[:len(oldNodes)]
+	for i := range remap {
+		remap[i] = -1
+	}
+	remap[0] = 0
+	remap[1] = 1
+	for level := bd.varCnt - 1; level >= 0; level-- {
+		for oldIdx := int32(2); oldIdx < int32(len(oldNodes)); oldIdx++ {
+			if oldNodes[oldIdx].level == level {
+				lo := remap[oldNodes[oldIdx].lo]
+				hi := remap[oldNodes[oldIdx].hi]
+				newIdx := bd.addNode(level, lo, hi)
+				remap[oldIdx] = newIdx
+			}
+		}
+	}
+	// Auto-remap externally referenced nodes.
+	bd.applyRemap(func(oldIdx int32) int32 {
+		if oldIdx >= 0 && int(oldIdx) < len(remap) {
+			return remap[oldIdx]
+		}
+		return oldIdx
+	})
+	return func(oldIdx int32) int32 {
+		if oldIdx >= 0 && int(oldIdx) < len(remap) {
+			return remap[oldIdx]
+		}
+		return oldIdx
 	}
 }
 
-func (bd *BDD) siftSwap(va, vb int32) {
-	if va == vb {
-		return
+func (bd *BDD) addNode(level, lo, hi int32) int32 {
+	if lo == hi {
+		return lo
 	}
-	affected := make([]int32, 0, len(bd.nodes)/4)
-	for i := int32(2); i < int32(len(bd.nodes)); i++ {
-		if bd.nodes[i].vari == va {
-			affected = append(affected, i)
-		}
-	}
-	for _, idx := range affected {
-		n := bd.nodes[idx]
-		lo := bd.cofactorSwap(n.lo, va, vb)
-		hi := bd.cofactorSwap(n.hi, va, vb)
-		newIdx := bd.unique(vb, lo, hi)
-		if newIdx != idx {
-			bd.replaceRefs(idx, newIdx)
-		}
-	}
-}
-
-func (bd *BDD) cofactorSwap(f, va, vb int32) int32 {
-	if f < 2 {
-		return f
-	}
-	n := bd.nodes[f]
-	if n.vari > vb {
-		return f
-	}
-	if n.vari == vb {
-		return bd.unique(va, bd.cofactorSwap(n.lo, va, vb), bd.cofactorSwap(n.hi, va, vb))
-	}
-	if n.vari == va {
-		return f
-	}
-	lo := bd.cofactorSwap(n.lo, va, vb)
-	hi := bd.cofactorSwap(n.hi, va, vb)
-	return bd.unique(n.vari, lo, hi)
-}
-
-func (bd *BDD) replaceRefs(oldIdx, newIdx int32) {
-	for i := int32(2); i < int32(len(bd.nodes)); i++ {
-		if bd.nodes[i].lo == oldIdx {
-			bd.nodes[i].lo = newIdx
-		}
-		if bd.nodes[i].hi == oldIdx {
-			bd.nodes[i].hi = newIdx
-		}
-	}
+	idx := int32(len(bd.nodes))
+	bd.nodes = append(bd.nodes, bddNode{level: level, lo: lo, hi: hi})
+	bd.uniq.put(level, lo, hi, idx)
+	return idx
 }
 
 func (b *BDD) Stats() Stats {
 	s := Stats{NodeCount: len(b.nodes), VarCount: int(b.varCnt)}
 	for i := int32(2); i < int32(len(b.nodes)); i++ {
-		v := b.nodes[i].vari
-		if int(v) < len(s.PerVar) {
-			s.PerVar[v]++
+		vari := b.level2var[b.nodes[i].level]
+		if int(vari) < len(s.PerVar) {
+			s.PerVar[vari]++
 		}
-		if b.nodes[i].lo == falseIdx {
+		if b.nodes[i].lo == int32(falseIdx) {
 			s.EdgesToFalse++
 		}
-		if b.nodes[i].hi == trueIdx {
+		if b.nodes[i].hi == int32(trueIdx) {
 			s.EdgesToTrue++
 		}
 	}

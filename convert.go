@@ -1,8 +1,12 @@
 package gobdd
 
-import "strings"
+import (
+	"strings"
 
-func (b *BDD) ToFormula(f int32) string {
+	"github.com/xDarkicex/memory"
+)
+
+func (b *BDD) ToFormula(f NodeID) string {
 	if f == falseIdx {
 		return "false"
 	}
@@ -10,16 +14,18 @@ func (b *BDD) ToFormula(f int32) string {
 		return "true"
 	}
 	var sb strings.Builder
-	b.formulaRec(f, &sb, make(map[int32]bool))
+	visited := memory.MustPoolSlice[bool](b.pool, len(b.nodes))
+	visited = visited[:len(b.nodes)]
+	b.formulaRec(f, &sb, visited)
 	return sb.String()
 }
 
-func (b *BDD) formulaRec(f int32, sb *strings.Builder, visited map[int32]bool) {
+func (b *BDD) formulaRec(f NodeID, sb *strings.Builder, visited []bool) {
 	if visited[f] {
 		return
 	}
 	visited[f] = true
-	if f < 2 {
+	if f.isTerm() {
 		if f == falseIdx {
 			sb.WriteString("0")
 		} else {
@@ -29,15 +35,15 @@ func (b *BDD) formulaRec(f int32, sb *strings.Builder, visited map[int32]bool) {
 	}
 	n := b.nodes[f]
 	sb.WriteString("(x")
-	sb.WriteString(itoa(int(n.vari)))
+	sb.WriteString(itoa(int(b.level2var[n.level])))
 	sb.WriteString(" ? ")
-	b.formulaRec(n.hi, sb, visited)
+	b.formulaRec(NodeID(n.hi), sb, visited)
 	sb.WriteString(" : ")
-	b.formulaRec(n.lo, sb, visited)
+	b.formulaRec(NodeID(n.lo), sb, visited)
 	sb.WriteString(")")
 }
 
-func (b *BDD) ToDNF(f int32) string {
+func (b *BDD) ToDNF(f NodeID) string {
 	if f == falseIdx {
 		return "false"
 	}
@@ -52,7 +58,7 @@ func (b *BDD) ToDNF(f int32) string {
 	return strings.Join(cubes, " ∨ ")
 }
 
-func (b *BDD) dnfWalk(f int32, literals []string, cubes *[]string) {
+func (b *BDD) dnfWalk(f NodeID, literals []string, cubes *[]string) {
 	if f == falseIdx {
 		return
 	}
@@ -65,17 +71,20 @@ func (b *BDD) dnfWalk(f int32, literals []string, cubes *[]string) {
 		return
 	}
 	n := b.nodes[f]
-	hiLit := make([]string, len(literals)+1)
+	vname := "x" + itoa(int(b.level2var[n.level]))
+	hiLit := memory.MustPoolSlice[string](b.pool, len(literals)+1)
+	hiLit = hiLit[:len(literals)+1]
 	copy(hiLit, literals)
-	hiLit[len(literals)] = "x" + itoa(int(n.vari))
-	b.dnfWalk(n.hi, hiLit, cubes)
-	loLit := make([]string, len(literals)+1)
+	hiLit[len(literals)] = vname
+	b.dnfWalk(NodeID(n.hi), hiLit, cubes)
+	loLit := memory.MustPoolSlice[string](b.pool, len(literals)+1)
+	loLit = loLit[:len(literals)+1]
 	copy(loLit, literals)
-	loLit[len(literals)] = "¬x" + itoa(int(n.vari))
-	b.dnfWalk(n.lo, loLit, cubes)
+	loLit[len(literals)] = "¬" + vname
+	b.dnfWalk(NodeID(n.lo), loLit, cubes)
 }
 
-func (b *BDD) ToCNF(f int32) string {
+func (b *BDD) ToCNF(f NodeID) string {
 	nf := b.Not(f)
 	dnf := b.ToDNF(nf)
 	if dnf == "true" {
