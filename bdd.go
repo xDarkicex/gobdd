@@ -1,4 +1,4 @@
-// Package gobdd implements Reduced Ordered Binary Decision Diagrams (ROBDDs)
+// Package gobdd implements Ordered Binary Decision Diagrams (OBDDs)
 // with off-heap memory via github.com/xDarkicex/memory.
 //
 // BDDs provide a canonical representation of Boolean functions. Two functions
@@ -15,13 +15,13 @@ import (
 )
 
 // BDD is a manager for Binary Decision Diagrams.
-// All state lives in off-heap Pool-allocated slices.
+// All state lives in off-heap Pool-allocated slices — zero GC pressure.
 type BDD struct {
-	nodes   []bddNode // Pool-backed node table
-	varCnt  int32     // number of variables registered
+	nodes   []bddNode  // Pool-backed node table
+	varCnt  int32      // number of variables registered
 	pool    *memory.Pool
 	uniq    *uniqTable // unique table: (var,lo,hi) → node index
-	cache   *opCache   // operation cache: (op,a,b) → result index
+	cache   *opCache   // operation cache for ITE memoization
 }
 
 type bddNode struct {
@@ -31,19 +31,17 @@ type bddNode struct {
 }
 
 const (
-	falseIdx = 0 // terminal False node index
-	trueIdx  = 1 // terminal True node index
+	falseIdx = 0
+	trueIdx  = 1
 )
 
 // New creates a BDD manager with the given number of variables.
-// All internal tables are Pool-backed — zero GC pressure.
 func New(numVars int, pool *memory.Pool) *BDD {
 	cap := numVars*256 + 16
 	nodes := memory.MustPoolSlice[bddNode](pool, cap)
-	nodes = nodes[:2] // reserve 0=False, 1=True
+	nodes = nodes[:2]
 	nodes[falseIdx] = bddNode{vari: -1, lo: -1, hi: -1}
 	nodes[trueIdx] = bddNode{vari: -1, lo: -1, hi: -1}
-
 	return &BDD{
 		nodes:  nodes,
 		varCnt: int32(numVars),
@@ -52,6 +50,9 @@ func New(numVars int, pool *memory.Pool) *BDD {
 		cache:  newOpCache(pool),
 	}
 }
+
+// VarCount returns the number of variables.
+func (b *BDD) VarCount() int32 { return b.varCnt }
 
 // Var returns the BDD for variable v (0-indexed).
 func (b *BDD) Var(v int32) int32 {
@@ -79,94 +80,107 @@ func (b *BDD) Xor(f, g int32) int32 { return b.ITE(f, b.Not(g), g) }
 // Equiv returns f ↔ g.
 func (b *BDD) Equiv(f, g int32) int32 { return b.ITE(f, g, b.Not(g)) }
 
-// ITE is the universal if-then-else: if f then g else h.
-// This is the core BDD operation — all Boolean ops reduce to ITE.
-// O(|f|·|g|·|h|) worst-case, O(|f|+|g|+|h|) with memoization. CC=7.
-func (b *BDD) ITE(f, g, h int32) int32 {
-	// Terminal cases
-	if f == trueIdx {
-		return g
-	}
-	if f == falseIdx {
-		return h
-	}
-	if g == h {
-		return g
-	}
-	if g == trueIdx && h == falseIdx {
-		return f
-	}
+// Nand returns ¬(f ∧ g).
+func (b *BDD) Nand(f, g int32) int32 { return b.Not(b.And(f, g)) }
 
-	// Check cache
-	if r, ok := b.cache.get(0, f, g, h); ok {
-		return r
-	}
+// Nor returns ¬(f ∨ g).
+func (b *BDD) Nor(f, g int32) int32 { return b.Not(b.Or(f, g)) }
 
-	// Pick top variable
-	v := b.topVar(f, g, h)
-
-	// Recurse: ITE(f, g, h) = (v ? ITE(f_hi, g_hi, h_hi) : ITE(f_lo, g_lo, h_lo))
-	lo := b.ITE(b.cofactor(f, v, false), b.cofactor(g, v, false), b.cofactor(h, v, false))
-	hi := b.ITE(b.cofactor(f, v, true), b.cofactor(g, v, true), b.cofactor(h, v, true))
-
-	if lo == hi {
-		b.cache.put(0, f, g, h, lo)
-		return lo
-	}
-
-	r := b.unique(v, lo, hi)
-	b.cache.put(0, f, g, h, r)
-	return r
-}
-
-// topVar returns the highest (smallest index) variable among non-terminal nodes.
-func (b *BDD) topVar(f, g, h int32) int32 {
-	v := b.varCnt
-	if f >= 2 && b.nodes[f].vari < v {
-		v = b.nodes[f].vari
-	}
-	if g >= 2 && b.nodes[g].vari < v {
-		v = b.nodes[g].vari
-	}
-	if h >= 2 && b.nodes[h].vari < v {
-		v = b.nodes[h].vari
-	}
-	return v
-}
-
-// cofactor returns f restricted to var=v with the given value.
-func (b *BDD) cofactor(f int32, v int32, value bool) int32 {
+// Restrict returns f with variable v set to value.
+// f[v := value] — cofactor operation. CC=3.
+func (b *BDD) Restrict(f int32, v int32, value bool) int32 {
 	if f < 2 {
 		return f
 	}
-	nf := b.nodes[f]
-	if nf.vari > v {
-		return f // variable doesn't appear in f
+	n := b.nodes[f]
+	if n.vari > v {
+		return f
 	}
-	if nf.vari == v {
+	if n.vari == v {
 		if value {
-			return nf.hi
+			return n.hi
 		}
-		return nf.lo
+		return n.lo
 	}
-	return f
+	lo := b.Restrict(n.lo, v, value)
+	hi := b.Restrict(n.hi, v, value)
+	return b.unique(n.vari, lo, hi)
 }
 
-// unique returns the canonical node for (var, lo, hi), reusing existing or creating new.
-func (b *BDD) unique(v, lo, hi int32) int32 {
-	if lo == hi {
-		return lo
-	}
-	if idx, ok := b.uniq.get(v, lo, hi); ok {
-		return idx
-	}
-	idx := int32(len(b.nodes))
-	b.nodes = append(b.nodes, bddNode{vari: v, lo: lo, hi: hi})
-	b.uniq.put(v, lo, hi, idx)
-	return idx
+// Exists returns ∃v. f — existential quantification.
+// ∃v. f = f[v:=0] ∨ f[v:=1]. CC=2.
+func (b *BDD) Exists(f int32, v int32) int32 {
+	return b.Or(b.Restrict(f, v, false), b.Restrict(f, v, true))
 }
 
-// SatisfyOne returns one satisfying assignment for f, or nil if f is False.
+// ExistsAll returns ∃vars. f — existentially quantify multiple variables.
+// CC=2.
+func (b *BDD) ExistsAll(f int32, vars []int32) int32 {
+	r := f
+	for _, v := range vars {
+		r = b.Exists(r, v)
+	}
+	return r
+}
+
+// ForAll returns ∀v. f — universal quantification.
+// ∀v. f = f[v:=0] ∧ f[v:=1]. CC=2.
+func (b *BDD) ForAll(f int32, v int32) int32 {
+	return b.And(b.Restrict(f, v, false), b.Restrict(f, v, true))
+}
+
+// ForAllVars returns ∀vars. f.
+func (b *BDD) ForAllVars(f int32, vars []int32) int32 {
+	r := f
+	for _, v := range vars {
+		r = b.ForAll(r, v)
+	}
+	return r
+}
+
+// Compose returns f[v := g] — substitute variable v with BDD g.
+// f composed with g for variable v. CC=4.
+func (b *BDD) Compose(f int32, v int32, g int32) int32 {
+	if f < 2 {
+		return f
+	}
+	n := b.nodes[f]
+	if n.vari > v {
+		return f
+	}
+	if n.vari == v {
+		return b.ITE(g, n.hi, n.lo)
+	}
+	lo := b.Compose(n.lo, v, g)
+	hi := b.Compose(n.hi, v, g)
+	return b.unique(n.vari, lo, hi)
+}
+
+// Support returns the set of variables that f depends on.
+// CC=3.
+func (b *BDD) Support(f int32) []int32 {
+	seen := make([]bool, b.varCnt)
+	b.supportWalk(f, seen)
+	var result []int32
+	for i, s := range seen {
+		if s {
+			result = append(result, int32(i))
+		}
+	}
+	return result
+}
+
+func (b *BDD) supportWalk(f int32, seen []bool) {
+	if f < 2 {
+		return
+	}
+	n := b.nodes[f]
+	seen[n.vari] = true
+	b.supportWalk(n.lo, seen)
+	b.supportWalk(n.hi, seen)
+}
+
+// SatisfyOne returns one satisfying assignment, or nil if f is False.
 func (b *BDD) SatisfyOne(f int32) []bool {
 	if f == falseIdx {
 		return nil
@@ -189,10 +203,129 @@ func (b *BDD) satWalk(f int32, assign []bool) {
 	}
 }
 
-// NodeCount returns the number of nodes in the BDD (including terminals).
+// SatisfyCount returns the number of satisfying assignments.
+// Uses dynamic programming on the BDD structure. CC=5.
+func (b *BDD) SatisfyCount(f int32) uint64 {
+	counts := memory.MustPoolSlice[uint64](b.pool, len(b.nodes))
+	counts = counts[:len(b.nodes)]
+	for i := range counts {
+		counts[i] = ^uint64(0) // sentinel for "not computed"
+	}
+	return b.satCount(f, counts)
+}
+
+func (b *BDD) satCount(f int32, counts []uint64) uint64 {
+	if f == falseIdx {
+		return 0
+	}
+	if f == trueIdx {
+		return 1 << uint(b.varCnt)
+	}
+	if counts[f] != ^uint64(0) {
+		return counts[f]
+	}
+	n := b.nodes[f]
+	lo := b.satCount(n.lo, counts)
+	hi := b.satCount(n.hi, counts)
+	// Each path skips the vars between this level and the child
+	loShift := lo >> 1
+	hiShift := hi >> 1
+	if n.lo < 2 || b.nodes[n.lo].vari != n.vari+1 {
+		loShift = lo >> 1
+	} else {
+		loShift = lo
+	}
+	if n.hi < 2 || b.nodes[n.hi].vari != n.vari+1 {
+		hiShift = hi >> 1
+	} else {
+		hiShift = hi
+	}
+	counts[f] = loShift + hiShift
+	return counts[f]
+}
+
+// NodeCount returns the total number of nodes.
 func (b *BDD) NodeCount() int { return len(b.nodes) }
 
-// --- Unique table ---
+// ITE is the universal if-then-else: if f then g else h.
+// O(|f|·|g|·|h|) worst-case, O(|f|+|g|+|h|) with memoization. CC=7.
+func (b *BDD) ITE(f, g, h int32) int32 {
+	if f == trueIdx {
+		return g
+	}
+	if f == falseIdx {
+		return h
+	}
+	if g == h {
+		return g
+	}
+	if g == trueIdx && h == falseIdx {
+		return f
+	}
+
+	if r, ok := b.cache.get(f, g, h); ok {
+		return r
+	}
+
+	v := b.topVar(f, g, h)
+	lo := b.ITE(b.cofactor(f, v, false), b.cofactor(g, v, false), b.cofactor(h, v, false))
+	hi := b.ITE(b.cofactor(f, v, true), b.cofactor(g, v, true), b.cofactor(h, v, true))
+
+	if lo == hi {
+		b.cache.put(f, g, h, lo)
+		return lo
+	}
+
+	r := b.unique(v, lo, hi)
+	b.cache.put(f, g, h, r)
+	return r
+}
+
+func (b *BDD) topVar(f, g, h int32) int32 {
+	v := b.varCnt
+	if f >= 2 && b.nodes[f].vari < v {
+		v = b.nodes[f].vari
+	}
+	if g >= 2 && b.nodes[g].vari < v {
+		v = b.nodes[g].vari
+	}
+	if h >= 2 && b.nodes[h].vari < v {
+		v = b.nodes[h].vari
+	}
+	return v
+}
+
+func (b *BDD) cofactor(f int32, v int32, value bool) int32 {
+	if f < 2 {
+		return f
+	}
+	nf := b.nodes[f]
+	if nf.vari > v {
+		return f
+	}
+	if nf.vari == v {
+		if value {
+			return nf.hi
+		}
+		return nf.lo
+	}
+	return f
+}
+
+func (b *BDD) unique(v, lo, hi int32) int32 {
+	if lo == hi {
+		return lo
+	}
+	if idx, ok := b.uniq.get(v, lo, hi); ok {
+		return idx
+	}
+	idx := int32(len(b.nodes))
+	b.nodes = append(b.nodes, bddNode{vari: v, lo: lo, hi: hi})
+	b.uniq.put(v, lo, hi, idx)
+	return idx
+}
+
+// --- Unique table (Pool-backed open addressing) ---
 
 type uniqTable struct {
 	buckets []uniqEntry
@@ -209,7 +342,7 @@ type uniqEntry struct {
 }
 
 func newUniqTable(pool *memory.Pool) *uniqTable {
-	cap := 16384
+	cap := 32768
 	buckets := memory.MustPoolSlice[uniqEntry](pool, cap)
 	buckets = buckets[:cap]
 	return &uniqTable{buckets: buckets, mask: uint32(cap - 1)}
@@ -232,7 +365,7 @@ func (u *uniqTable) get(v, lo, hi int32) (int32, bool) {
 
 func (u *uniqTable) put(v, lo, hi, id int32) {
 	if u.size >= len(u.buckets)/2 {
-		return // grow not implemented for v1 — rely on initial capacity
+		return
 	}
 	h := uniqHash(v, lo, hi)
 	idx := h & u.mask
@@ -251,7 +384,7 @@ func uniqHash(v, lo, hi int32) uint32 {
 	return h
 }
 
-// --- Operation cache ---
+// --- Operation cache (ITE memoization) ---
 
 type opCache struct {
 	buckets []cacheEntry
@@ -274,7 +407,7 @@ func newOpCache(pool *memory.Pool) *opCache {
 	return &opCache{buckets: buckets, mask: uint32(cap - 1)}
 }
 
-func (c *opCache) get(_ int32, f, g, h int32) (int32, bool) {
+func (c *opCache) get(f, g, h int32) (int32, bool) {
 	hash := cacheHash(f, g, h)
 	idx := hash & c.mask
 	for {
@@ -289,7 +422,7 @@ func (c *opCache) get(_ int32, f, g, h int32) (int32, bool) {
 	}
 }
 
-func (c *opCache) put(_ int32, f, g, h, r int32) {
+func (c *opCache) put(f, g, h, r int32) {
 	if c.size >= len(c.buckets)/2 {
 		return
 	}
