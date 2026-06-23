@@ -1,5 +1,5 @@
-github.com/xDarkicex/memory v1.0.35 h1:xHbIFLvL4obgpxLa494x0rvlhFbZ7+YlKhEeaXxghTY=
-github.com/xDarkicex/memory v1.0.35/go.mod h1:ucTTiUZMrWXY/nDFkyLMlQ7BnO3qCmG2P2BMJKOSdGc=
+github.com/xDarkicex/memory v1.0.36 h1:O6kUm798Q67JKq4gFeiA4ZGb6kbf69SDHAcgy7Ww5AI=
+github.com/xDarkicex/memory v1.0.36/go.mod h1:ucTTiUZMrWXY/nDFkyLMlQ7BnO3qCmG2P2BMJKOSdGc=
 go.uber.org/goleak v1.3.0 h1:2K3zAYmnTNqV73imy9J1T3WC+gmCePx2hEGkimedGto=
 go.uber.org/goleak v1.3.0/go.mod h1:CoHD4mav9JJNrW/WLlf7HGZPjdw8EucARQHekz1X6bE=
 golang.org/x/sys v0.43.0 h1:Rlag2XtaFTxp19wS8MXlJwTvoh8ArU6ezoyFsMyCTNI=
